@@ -1,0 +1,382 @@
+#cloud-config
+hostname: ${hostname}
+fqdn: ${hostname}
+preserve_hostname: false
+manage_etc_hosts: true
+
+users:
+  - name: ${ssh_user}
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - ${ssh_public_key}
+    groups: users, wheel
+    lock_passwd: true
+
+package_update: true
+package_upgrade: false
+
+packages:
+  - curl
+  - wget
+  - vim
+  - git
+  - net-tools
+  - dnf-plugins-core
+  - nmap-ncat
+
+write_files:
+  - path: /etc/sysctl.d/99-elasticsearch.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      vm.max_map_count=262144
+      vm.swappiness=1
+      net.ipv4.ip_forward=1
+
+  - path: /etc/docker/daemon.json
+    owner: root:root
+    permissions: '0644'
+    content: |
+      {
+        "log-driver": "json-file",
+        "log-opts": {
+          "max-size": "10m",
+          "max-file": "3"
+        }
+      }
+
+  # === compose.yml ===
+  - path: /opt/elk/compose.yml
+    owner: root:root
+    permissions: '0644'
+    content: |
+      services:
+        elasticsearch:
+          image: docker.elastic.co/elasticsearch/elasticsearch:${elk_version}
+          container_name: elasticsearch
+          restart: unless-stopped
+          environment:
+            - node.name=es-node
+            - cluster.name=elk-lab-cluster
+            - discovery.type=single-node
+            - bootstrap.memory_lock=true
+            - "ES_JAVA_OPTS=-Xms2g -Xmx2g"
+            - xpack.security.enabled=false
+            - xpack.security.enrollment.enabled=false
+            - xpack.security.http.ssl.enabled=false
+          ulimits:
+            memlock:
+              soft: -1
+              hard: -1
+            nofile:
+              soft: 65536
+              hard: 65536
+          volumes:
+            - es-data:/usr/share/elasticsearch/data
+          ports:
+            - "9200:9200"
+            - "9300:9300"
+          networks:
+            - elk-network
+          healthcheck:
+            test: ["CMD-SHELL", "curl -f http://localhost:9200 || exit 1"]
+            interval: 10s
+            timeout: 5s
+            retries: 30
+            start_period: 90s
+
+        logstash:
+          image: docker.elastic.co/logstash/logstash:${elk_version}
+          container_name: logstash
+          restart: unless-stopped
+          volumes:
+            - ./logstash/pipeline:/usr/share/logstash/pipeline:ro
+          ports:
+            - "5044:5044"
+            - "5000:5000"
+            - "9600:9600"
+          environment:
+            - "LS_JAVA_OPTS=-Xms512m -Xmx512m"
+            - xpack.monitoring.enabled=false
+          networks:
+            - elk-network
+          depends_on:
+            elasticsearch:
+              condition: service_healthy
+
+        kibana:
+          image: docker.elastic.co/kibana/kibana:${elk_version}
+          container_name: kibana
+          restart: unless-stopped
+          environment:
+            - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+            - SERVER_HOST=0.0.0.0
+            - XPACK_SECURITY_ENABLED=false
+          ports:
+            - "5601:5601"
+          networks:
+            - elk-network
+          depends_on:
+            elasticsearch:
+              condition: service_healthy
+
+        filebeat:
+          image: docker.elastic.co/beats/filebeat:8.19.0
+          container_name: filebeat
+          restart: unless-stopped
+          user: root
+          command: filebeat -e --strict.perms=false
+          volumes:
+            - ./filebeat/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+            - /var/lib/docker/containers:/var/lib/docker/containers:ro
+            - /var/run/docker.sock:/var/run/docker.sock:ro
+          networks:
+            - elk-network
+          depends_on:
+            - logstash
+
+        myapp:
+          build: /opt/myapp
+          container_name: myapp
+          restart: unless-stopped
+          ports:
+            - "8000:8000"
+          networks:
+            - elk-network
+
+      networks:
+        elk-network:
+          driver: bridge
+
+      volumes:
+        es-data:
+          driver: local
+
+  # === logstash.conf (АКТУАЛЬНАЯ ВЕРСИЯ) ===
+  - path: /opt/elk/logstash/pipeline/logstash.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      input {
+        tcp {
+          port => 5000
+          codec => json_lines
+          type => "json-tcp"
+        }
+        beats {
+          port => 5044
+        }
+      }
+
+      filter {
+        if [container][name] in ["filebeat", "logstash", "elasticsearch", "kibana"] {
+          drop { }
+        }
+
+        if [message] and [message] =~ /^\{/ {
+          json {
+            source => "message"
+            target => "parsed"
+            skip_on_invalid_json => true
+          }
+
+          if [parsed][message] {
+            mutate { replace => { "message" => "%%{[parsed][message]}" } }
+          }
+          if [parsed][level] {
+            mutate { copy => { "[parsed][level]" => "level" } }
+          }
+          if [parsed][service] {
+            mutate { copy => { "[parsed][service]" => "service" } }
+          }
+          if [parsed][logger] {
+            mutate { copy => { "[parsed][logger]" => "logger" } }
+          }
+          if [parsed][exception] {
+            mutate { copy => { "[parsed][exception]" => "exception" } }
+          }
+          if [parsed][@timestamp] {
+            mutate { copy => { "[parsed][@timestamp]" => "app_timestamp" } }
+          }
+          if [parsed][host] {
+            mutate { copy => { "[parsed][host]" => "app_host" } }
+          }
+
+          mutate {
+            remove_field => ["parsed"]
+          }
+        }
+
+        mutate {
+          remove_field => ["docker"]
+        }
+      }
+
+      output {
+        elasticsearch {
+          hosts => ["http://elasticsearch:9200"]
+          index => "logs-elastic"
+        }
+      }
+
+  # === filebeat.yml ===
+  - path: /opt/elk/filebeat/filebeat.yml
+    owner: root:root
+    permissions: '0644'
+    content: |
+      filebeat.inputs:
+        - type: container
+          enabled: true
+          paths:
+            - /var/lib/docker/containers/*/*.log
+          parsers:
+            - container:
+                stream: all
+                format: docker
+          processors:
+            - add_docker_metadata:
+                host: "unix:///var/run/docker.sock"
+
+      output.logstash:
+        hosts: ["logstash:5044"]
+
+      logging.level: info
+
+  # === myapp/app.py ===
+  - path: /opt/myapp/app.py
+    owner: root:root
+    permissions: '0644'
+    content: |
+      import json
+      import logging
+      import os
+      import random
+      import sys
+      import time
+      from datetime import datetime
+      from flask import Flask, request, jsonify
+
+      app = Flask(__name__)
+
+      class JsonFormatter(logging.Formatter):
+          def format(self, record):
+              log_obj = {
+                  "@timestamp": datetime.utcnow().isoformat() + "Z",
+                  "level": record.levelname,
+                  "logger": record.name,
+                  "message": record.getMessage(),
+                  "service": "myapp",
+                  "host": os.uname().nodename,
+              }
+              if record.exc_info:
+                  log_obj["exception"] = self.formatException(record.exc_info)
+              return json.dumps(log_obj)
+
+      handler = logging.StreamHandler(sys.stdout)
+      handler.setFormatter(JsonFormatter())
+      logger = logging.getLogger("myapp")
+      logger.addHandler(handler)
+      logger.setLevel(logging.INFO)
+
+      @app.route("/")
+      def index():
+          logger.info("Health check OK")
+          return jsonify({"status": "ok", "service": "myapp"})
+
+      @app.route("/order/<int:order_id>")
+      def order(order_id):
+          user_id = request.args.get("user_id", "unknown")
+          logger.info(f"Processing order {order_id} for user {user_id}")
+          time.sleep(0.1)
+          logger.info(f"Order {order_id} completed")
+          return jsonify({"order_id": order_id, "status": "completed"})
+
+      @app.route("/error")
+      def error():
+          logger.error("Simulated error: database connection failed")
+          return jsonify({"error": "internal server error"}), 500
+
+      @app.route("/warning")
+      def warning():
+          logger.warning("High memory usage detected: 85%")
+          return jsonify({"status": "warned"})
+
+      @app.route("/slow")
+      def slow():
+          delay = random.uniform(2, 5)
+          logger.info(f"Slow request started, delay {delay:.2f}s")
+          time.sleep(delay)
+          logger.warning(f"Slow request finished in {delay:.2f}s (threshold 1s)")
+          return jsonify({"delay": delay})
+
+      @app.route("/crash")
+      def crash():
+          try:
+              1 / 0
+          except Exception as e:
+              logger.exception(f"Unhandled exception: {e}")
+          return jsonify({"error": "crashed"}), 500
+
+      @app.route("/random")
+      def random_endpoint():
+          r = random.random()
+          if r < 0.6:
+              logger.info("Random request OK")
+              return jsonify({"result": "ok"})
+          elif r < 0.85:
+              logger.warning("Random request warning: cache miss")
+              return jsonify({"result": "warn"}), 200
+          else:
+              logger.error("Random request error: upstream timeout")
+              return jsonify({"result": "error"}), 500
+
+      if __name__ == "__main__":
+          logger.info("Starting myapp on port 8000")
+          app.run(host="0.0.0.0", port=8000)
+
+  # === myapp/Dockerfile ===
+  - path: /opt/myapp/Dockerfile
+    owner: root:root
+    permissions: '0644'
+    content: |
+      FROM python:3.11-slim
+
+      WORKDIR /app
+
+      RUN pip install --no-cache-dir flask
+
+      COPY app.py .
+
+      EXPOSE 8000
+
+      CMD ["python", "app.py"]
+
+runcmd:
+  - [ hostnamectl, set-hostname, ${hostname} ]
+  - [ sh, -c, "sed -i '/^127.0.1.1/d' /etc/hosts" ]
+  - [ sh, -c, "echo '127.0.1.1 ${hostname}' >> /etc/hosts" ]
+  - [ sh, -c, "echo '${hostname}' > /etc/hostname" ]
+
+  - [ timedatectl, set-timezone, ${timezone} ]
+  - [ sysctl, --system ]
+
+  - [ sh, -c, "systemctl stop firewalld 2>/dev/null || true" ]
+  - [ sh, -c, "systemctl disable firewalld 2>/dev/null || true" ]
+
+  - [ sh, -c, "rm -f /etc/yum.repos.d/docker-ce.repo" ]
+  - [ sh, -c, "dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo" ]
+  - [ dnf, makecache ]
+  - [ dnf, install, -y, --allowerasing, docker-ce, docker-ce-cli, containerd.io, docker-buildx-plugin, docker-compose-plugin ]
+
+  - [ systemctl, enable, --now, docker ]
+  - [ usermod, -aG, docker, ${ssh_user} ]
+
+  - [ sh, -c, "mkdir -p /home/${ssh_user}" ]
+  - [ sh, -c, "cp -r /opt/elk /home/${ssh_user}/elk" ]
+  - [ sh, -c, "cp -r /opt/myapp /home/${ssh_user}/myapp" ]
+  - [ sh, -c, "chown -R ${ssh_user}:${ssh_user} /home/${ssh_user}/elk /home/${ssh_user}/myapp" ]
+
+  - [ sh, -c, "cd /home/${ssh_user}/elk && docker compose up -d --build" ]
+
+final_message: "ELK Lab is ready! Kibana on 5601, myapp on 8000"
