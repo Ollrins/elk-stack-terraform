@@ -2,15 +2,6 @@
 
 Развёртывание полноценного ELK-стека (Elasticsearch + Logstash + Kibana + Filebeat) с тестовым приложением и дашбордом, **полностью управляемым через Terraform**.
 
-## Что внутри
-
-- **Инфраструктура:** VM в Yandex Cloud (прерываемая, 4 vCPU / 8 GB RAM / 30 GB SSD) через Terraform.
-- **Автоматизация:** `cloud-init` ставит Docker, поднимает ELK-стек и приложение.
-- **ELK-стек:** Elasticsearch 9.4.0, Kibana 9.4.0, Logstash 9.4.0, Filebeat 8.19.0 (стабильная ветка, совместима с 9.x).
-- **Приложение:** Flask-приложение `myapp` с JSON-логами (INFO/WARN/ERROR/exception).
-- **Дашборд:** создаётся через Terraform-провайдер `elasticstack` (IaC, не руками в UI).
-- **Мониторинг:** сбор логов Docker-контейнеров через Filebeat → Logstash → Elasticsearch → Kibana.
-
 ## Архитектура
 
 ### Общая схема
@@ -21,25 +12,25 @@
 │                                                                              │
 │  ┌────────────────────────────────────────────────────────────────────────┐  │
 │  │                     VM: elk-lab (Ubuntu/Rocky 9)                       │  │
-│  │                    4 vCPU / 8 GB RAM / 30 GB SSD                      │  │
+│  │                    4 vCPU / 8 GB RAM / 30 GB SSD                       │  │
 │  │                                                                        │  │
 │  │  ┌──────────────────────────────────────────────────────────────────┐  │  │
 │  │  │                    Docker network: elk-network                   │  │  │
 │  │  │                                                                  │  │  │
-│  │  │  ┌─────────────┐    ┌─────────────┐    ┌─────────────────────┐  │  │  │
-│  │  │  │   myapp     │    │  Filebeat   │    │      Logstash       │  │  │  │
-│  │  │  │  (Flask)    │───▶│   8.19.0    │───▶│       9.4.0         │  │  │  │
-│  │  │  │  :8000      │    │  :5044 out  │    │  :5044 in (beats)   │  │  │  │
-│  │  │  │  JSON logs  │    │  :5066 mon  │    │  :5000 in (tcp json)│  │  │  │
-│  │  │  └─────────────┘    └─────────────┘    │  :9600 mon          │  │  │  │
-│  │  │         │                  ▲           └──────────┬──────────┘  │  │  │
-│  │  │         │                  │                      │             │  │  │
-│  │  │         │ stdout           │ читает               │ пишет       │  │  │
-│  │  │         ▼                  │ /var/lib/docker/     ▼             │  │  │
-│  │  │  ┌─────────────────────────────────────┐  ┌─────────────────┐   │  │  │
-│  │  │  │  /var/lib/docker/containers/*/*.log │  │  Elasticsearch  │   │  │  │
-│  │  │  │  (Docker json-file driver)          │  │     9.4.0       │   │  │  │
-│  │  │  └─────────────────────────────────────┘  │  :9200 HTTP     │   │  │  │
+│  │  │  ┌─────────────┐    ┌─────────────┐    ┌─────────────────────┐   │  │  │
+│  │  │  │   myapp     │    │  Filebeat   │    │      Logstash       │   │  │  │
+│  │  │  │  (Flask)    │───▶│   8.19.0    │───▶│       9.4.0        │   │  │  │
+│  │  │  │  :8000      │    │  :5044 out  │    │  :5044 in (beats)   │   │  │  │
+│  │  │  │  JSON logs  │    │  :5066 mon  │    │  :5000 in (tcp json)│   │  │  │
+│  │  │  └─────────────┘    └─────────────┘    │  :9600 mon          │   │  │  │
+│  │  │         │                  ▲           └──────────┬──────────┘   │  │  │
+│  │  │         │                  │                      │              │  │  │
+│  │  │         │ stdout           │ читает               │ пишет        │  │  │
+│  │  │         ▼                  │ /var/lib/docker/     ▼              │  │  │
+│  │  │  ┌─────────────────────────────────────┐  ┌─────────────────┐    │  │  │
+│  │  │  │  /var/lib/docker/containers/*/*.log │  │  Elasticsearch  │    │  │  │
+│  │  │  │  (Docker json-file driver)          │  │     9.4.0       │    │  │  │
+│  │  │  └─────────────────────────────────────┘  │  :9200 HTTP     │    │  │  │
 │  │  │                                            │  :9300 transport│   │  │  │
 │  │  │                                            │  volume: es-data│   │  │  │
 │  │  │                                            └────────┬────────┘   │  │  │
@@ -56,7 +47,7 @@
 │  │  5044 (Logstash Beats), 9600 (Logstash API), 8000 (myapp)              │  │
 │  └────────────────────────────────────────────────────────────────────────┘  │
 │                                                                              │
-│  Terraform управляет: VM, VPC, subnet, Security Group, дашбордом Kibana     │
+│  Terraform управляет: VM, VPC, subnet, Security Group, дашбордом Kibana      │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 ### Поток данных
@@ -143,43 +134,6 @@ terraform/
 | `null_resource.wait_for_kibana` | Ожидание готовности Kibana по SSH | `yandex_compute_instance.elk` |
 | `elasticstack_kibana_dashboard.myapp_monitoring` | Дашборд `MyApp Monitoring` в Kibana | `null_resource.wait_for_kibana` |
 
-#### Переменные (`variables.tf` / `terraform.tfvars`)
-
-| Переменная | Назначение | Пример |
-|------------|-----------|--------|
-| `service_account_key_file` | Путь к ключу сервисного аккаунта | `/home/Ollrins/key.json` |
-| `cloud_id` | ID облака Yandex Cloud | `b1gXXXXXXXXXXXXXXXXX` |
-| `folder_id` | ID каталога | `b1gYYYYYYYYYYYYYYYYY` |
-| `ssh_public_key` | Путь к публичному SSH-ключу | `/home/Ollrins/key.pub` |
-| `ssh_user` | Имя пользователя SSH | `Ollrins` |
-| `vm_name` | Имя VM | `elk-lab` |
-| `zone` | Зона доступности | `ru-central1-d` |
-| `elk_version` | Версия Elastic Stack | `9.4.0` |
-| `kibana_ip` | Публичный IP Kibana (для провайдера `elasticstack`) | `153.51.163.10` |
-| `vm_cores` | vCPU | `4` |
-| `vm_memory` | RAM (GB) | `8` |
-| `disk_size` | Размер диска (GB) | `30` |
-| `disk_type` | Тип диска | `network-ssd` |
-
-#### Провайдеры
-
-```hcl
-terraform {
-  required_providers {
-    yandex = {
-      source  = "yandex-cloud/yandex"
-      version = "~> 0.193.0"
-    }
-    elasticstack = {
-      source  = "elastic/elasticstack"
-      version = "~> 0.17.0"
-    }
-  }
-}
-```
-
-- **`yandex`** — управляет VM, VPC, subnet, Security Group.
-- **`elasticstack`** — управляет дашбордом Kibana через API `/api/dashboards`.
 
 #### Особенности
 
@@ -205,6 +159,7 @@ for i in $(seq 1 10); do curl -s http://<IP>:8000/crash > /dev/null; done
 
 # Проверить в ES
 curl -s "http://<IP>:9200/logs-elastic/_count?pretty"
+```
 
 ## Дашборд в Kibana
 
